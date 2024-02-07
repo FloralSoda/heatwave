@@ -51,7 +51,7 @@ impl<'window> GpuConnection<'window> {
 
 		let adapter = match instance.request_adapter(
 			&wgpu::RequestAdapterOptions {
-				power_preference: config.power_preference(),
+				power_preference: config.power_preference,
 				compatible_surface: Some(&surface),
 				force_fallback_adapter: false
 			}
@@ -62,7 +62,7 @@ impl<'window> GpuConnection<'window> {
 
 		let future_device = adapter.request_device(
 			&wgpu::DeviceDescriptor {
-				required_features: config.gpu_features(),
+				required_features: config.features,
 				required_limits: wgpu::Limits::default(),
 				label: Some("Heatwave Adapter")
 			}, None
@@ -109,8 +109,8 @@ pub struct GpuConnectionError {
 	inner: GpuConnectionErrorKind
 }
 impl GpuConnectionError {
-	pub fn kind(&self) -> GpuConnectionErrorKind {
-		self.inner
+	pub fn kind(&self) -> &GpuConnectionErrorKind {
+		&self.inner
 	}
 }
 ///Describes errors thrown by a [`GpuConnection`]
