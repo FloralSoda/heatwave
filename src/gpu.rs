@@ -1,35 +1,39 @@
 use std::sync::Arc;
 
+use wgpu::{CreateSurfaceError, RequestDeviceError};
 use winit::window::Window;
 
 use crate::HeatwaveConfig;
 
 ///Holds all relevant CPU objects for communication with the GPU
-/// 
-///The OS window is stored here, as well, as the GPU connections are bound to it.
 pub struct GpuConnection<'window> {
-	instance: wgpu::Instance,
-	surface: wgpu::Surface<'window>,
-	surface_config: wgpu::SurfaceConfiguration,
-	adapter: wgpu::Adapter,
-	device: wgpu::Device,
-	queue: wgpu::Queue,
-	texture_size: winit::dpi::PhysicalSize<u32>,
+	//This is commented out as instance isn't currently needed. Comment this back in if instance is needed later down the line
+	//instance: wgpu::Instance,
+	//This is commented out as adapter isn't currently needed. Comment this back in if adapter is needed later down the line
+	//adapter: wgpu::Adapter,
 
-	///Window is stored here due to unsafe references with the surface
-	///It must be after `surface` due to Rust's drop order guarantee (Objects are dropped in reverse order)
-	window: Arc<Window>
+	///Reference to the presentable surface (Where the GPU draws to)
+	surface: wgpu::Surface<'window>,
+	///The configuration for the surface. Needed for future changes to the surface
+	surface_config: wgpu::SurfaceConfiguration,
+	///The connection to the physical graphics device.
+	device: wgpu::Device,
+	///Sends and executes command buffers on the GPU
+	queue: wgpu::Queue,
+	///The size of the current draw texture.
+	texture_size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl<'window> GpuConnection<'window> {
 	///Creates a new GPU connection bound to the window provided.
 	/// 
-	///Takes ownership of the window.
-	pub async fn new(window: Window, config: &HeatwaveConfig) -> Self 
+	///# Errors
+	/// 
+	///# Panics
+	/// On iOS, this will panic if not called on the main thread.
+	pub async fn new(window: Arc<Window>, config: &HeatwaveConfig) -> Result<Self, GpuConnectionError> 
 	{
 		let size = window.inner_size();
-
-		let window_ref = Arc::new(window);
 
 		assert!(size.width > 0 && size.height > 0, "Window size has to be above 0!");
 
@@ -37,27 +41,32 @@ impl<'window> GpuConnection<'window> {
 			backends: wgpu::Backends::PRIMARY,
 			..Default::default() //Allowing non-compliant adapters might be supported at a later date
 		});
+ 
+		let surface = match instance.create_surface(window.clone()) {
+			Ok(surface) => surface,
+			Err(error) => {
+				return Err(GpuConnectionError { inner: GpuConnectionErrorKind::SurfaceCreation(error) } );
+			}
+		};
 
-		//This is safe as window is owned by this struct and is ensured to deconstruct before surface does by Rust's drop order
-		//This is safe in Rust 1.75.0
-		let surface = instance.create_surface(window_ref.clone())
-									.expect("Expected a window that a gpu surface could build from");
-
-		let adapter = instance.request_adapter(
+		let adapter = match instance.request_adapter(
 			&wgpu::RequestAdapterOptions {
 				power_preference: config.power_preference(),
 				compatible_surface: Some(&surface),
 				force_fallback_adapter: false
 			}
-		).await.expect("No adapter was found that met the requirements");
+		).await {
+			Some(adapter) => adapter,
+			None => return Err(GpuConnectionError { inner: GpuConnectionErrorKind::CompatibleAdapterNotFound })
+		};
 
-		let (device, queue) = adapter.request_device(
+		let future_device = adapter.request_device(
 			&wgpu::DeviceDescriptor {
 				required_features: config.gpu_features(),
 				required_limits: wgpu::Limits::default(),
 				label: Some("Heatwave Adapter")
 			}, None
-		).await.expect("Graphical features requested are not supported");
+		);
 
 		let surface_capabilities = surface.get_capabilities(&adapter);
 		let surface_format = surface_capabilities.formats.iter()
@@ -76,18 +85,37 @@ impl<'window> GpuConnection<'window> {
 			desired_maximum_frame_latency: 2
 		};
 
+		let (device, queue) = match future_device.await {
+			Ok(tuple) => tuple,
+			Err(error) => { return Err(GpuConnectionError { inner: GpuConnectionErrorKind::DeviceRequest(error)}); }
+		};
+
 		surface.configure(&device, &surface_config);
 
 
-		GpuConnection {
-			instance,
+		Ok(GpuConnection {
+			//instance,
+			//adapter,
 			surface,
 			surface_config,
-			adapter,
 			device,
 			queue,
-			texture_size: size,
-			window: window_ref
-		}
+			texture_size: size
+		})
 	}
+}
+
+pub struct GpuConnectionError {
+	inner: GpuConnectionErrorKind
+}
+impl GpuConnectionError {
+	pub fn kind(&self) -> GpuConnectionErrorKind {
+		self.inner
+	}
+}
+///Describes errors thrown by a [`GpuConnection`]
+pub enum GpuConnectionErrorKind {
+	SurfaceCreation(CreateSurfaceError),
+	DeviceRequest(RequestDeviceError),
+	CompatibleAdapterNotFound
 }

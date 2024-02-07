@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use gpu::GpuConnection;
-use wgpu::TextureFormat;
+use wgpu::Features;
 use winit::window::Window;
 
 ///Contains any structs relating to GPU connections and GPU objects
@@ -22,13 +22,14 @@ pub struct HeatwaveApp<'a> {
 	connection: GpuConnection<'a>,
 	
 	buffers: HashMap<usize, wgpu::Buffer>,
+	next_buffer_id: usize,
+	
 	render_pipelines: HashMap<usize, wgpu::RenderPipeline>,
 	compute_pipelines: HashMap<usize, wgpu::ComputePipeline>,
-	next_buffer_id: usize,
 	next_render_id: usize,
-	next_compute_id: usize,
+	next_compute_id: usize, 
 
- 
+	window: Window
 }
 impl<'a> HeatwaveApp<'a> {
 	#[cfg(target_arch = "wasm32")]
@@ -55,7 +56,7 @@ impl<'a> HeatwaveApp<'a> {
 pub struct HeatwaveConfig {
 	pub power_pref: wgpu::PowerPreference,
 	pub name: String,
-
+	pub features: wgpu::Features
 }
 impl HeatwaveConfig {
 	pub fn name(&self) -> String {
@@ -65,7 +66,7 @@ impl HeatwaveConfig {
 		self.power_pref
 	}
 	pub fn gpu_features(&self) -> wgpu::Features {
-		
+		self.features
 	}
 }
 impl Default for HeatwaveConfig {
@@ -73,6 +74,8 @@ impl Default for HeatwaveConfig {
         Self { 
 			power_pref: wgpu::PowerPreference::HighPerformance, //Default to the best GPU it can find, as this is the most common one to ask for
 			name: String::from("Heatwave App"),
+			features: Features::empty()
 		}
     }
 }
+

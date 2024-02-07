@@ -21,6 +21,7 @@ bytemuck = { version="1.14.0", features=["derive"]}
 image = { version="0.24.7", features=["png"], default-features = false}
 raw-window-handle = "0.6.0"
 cfg-if = "1.0.0"
+bitflags = "2.4.2"
 
 
 [dev-dependencies]
