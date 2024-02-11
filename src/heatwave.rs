@@ -5,11 +5,12 @@
 //! 
 //! Though this project uses wgpu in its backend, it doesn't currently fully support wasm.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use gpu::{GpuConnection, GpuConnectionError};
-use wgpu::Features;
-use winit::{error::{EventLoopError, OsError}, event_loop::EventLoop, window::{Fullscreen, Window, WindowBuilder, WindowButtons, WindowLevel}};
+use rendering::Presenter;
+use wgpu::{BindGroupLayoutDescriptor, ComputePipelineDescriptor, Features, PipelineLayout, PushConstantRange, RenderPipelineDescriptor};
+use winit::{error::{EventLoopError, OsError}, event::Event, event_loop::{EventLoop, EventLoopWindowTarget}, window::{Fullscreen, Window, WindowBuilder, WindowButtons, WindowLevel}};
 
 ///Contains any structs relating to GPU connections and GPU objects
 pub mod gpu;
@@ -17,7 +18,7 @@ pub mod gpu;
 pub mod rendering;
 
 ///Represents an app in Heatwave, with references to the presenter, window and GPU bindings/
-///
+
 pub struct HeatwaveApp<'a> {
 	connection: GpuConnection<'a>,
 	
@@ -27,9 +28,11 @@ pub struct HeatwaveApp<'a> {
 	render_pipelines: HashMap<usize, wgpu::RenderPipeline>,
 	compute_pipelines: HashMap<usize, wgpu::ComputePipeline>,
 	next_render_id: usize,
-	next_compute_id: usize, 
+	next_compute_id: usize,
+	
+	pipeline_layout: PipelineLayout,
 
-	event_loop: EventLoop<()>,
+	event_loop: Option<EventLoop<()>>,
 	window: Arc<Window>
 }
 impl<'a> HeatwaveApp<'a> {
@@ -49,7 +52,7 @@ impl<'a> HeatwaveApp<'a> {
 		env_logger::init();
 	}
 
-	pub async fn new(config: HeatwaveConfig) -> Result<Self, HeatwaveInitialiseError> {
+	pub async fn new<'b>(config: HeatwaveConfig<'b>) -> Result<Self, HeatwaveInitialiseError> {
 		let mut window = WindowBuilder::new()
 			.with_title(&config.name)
 			.with_inner_size(config.default_size)
@@ -79,24 +82,135 @@ impl<'a> HeatwaveApp<'a> {
 	///Attaches a new HeatwaveWindow to a pre-existing WindowBuilder. 
 	/// 
 	///**Window-related configuration in HeatwaveConfig is ignored**
-	pub async fn new_with_window(builder: WindowBuilder, config: HeatwaveConfig) -> Result<Self, HeatwaveInitialiseError> {
+	pub async fn new_with_window<'b>(builder: WindowBuilder, config: HeatwaveConfig<'b>) -> Result<Self, HeatwaveInitialiseError> {
 		let event_loop = EventLoop::new()?;
+		let window = builder.build(&event_loop)?;
+		let window_ref = Arc::new(window);
 
-		let window = Arc::new(builder.build(&event_loop)?);
+		let connection_future = GpuConnection::new(window_ref.clone(), &config);
 
-		let connection_future = GpuConnection::new(window.clone(), &config);
+		let connection = connection_future.await?;
+
+		let pipeline_layout = connection.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+			label: Some("Heatwave Render Pipeline Layout"),
+			bind_group_layouts: &[], //todo: Bind groups https://sotrh.github.io/learn-wgpu/beginner/tutorial5-textures/#the-bindgroup
+			push_constant_ranges: config.push_constants
+		});
 		Ok(HeatwaveApp {
-			window,
-			event_loop,
+			window: window_ref,
+			event_loop: Some(event_loop),
 			buffers: HashMap::new(),
 			next_buffer_id: 0,
 			render_pipelines: HashMap::new(),
 			compute_pipelines: HashMap::new(),
 			next_compute_id: 0,
 			next_render_id: 0,
-			connection: connection_future.await?,
+			connection,
+			pipeline_layout
 		})
 	}
+
+	///Adds a new render pipeline to the heatwave window using the descriptor provided.
+	/// 
+	///Fills in the layout with this heatwave instance's pipeline layout if none is provided
+	/// 
+	///Fills in a render target for the fragment shader is none are provided but a fragment shader is provided.\
+	///Uses a ColorTarget with the format of the heatwave instance's surface, a blend mode of Replace and targets all colour channels. 
+	pub fn add_render_pipeline<'b>(&mut self, descriptor: impl Into<RenderPipelineDescriptor<'b>>) -> usize {
+		let mut desc: RenderPipelineDescriptor = descriptor.into();
+		if desc.layout.is_none() {
+			desc.layout = Some(&self.pipeline_layout);
+		}
+
+		let targets;
+		if let Some(fragment) = &mut desc.fragment {
+			if fragment.targets.is_empty() {
+				targets = [Some(wgpu::ColorTargetState {
+					format: self.connection.surface_config().format,
+					blend: Some(wgpu::BlendState::REPLACE),
+					write_mask: wgpu::ColorWrites::ALL
+				})];
+				fragment.targets = &targets;
+			}
+		}
+		let pipeline = self.connection.device().create_render_pipeline(&desc);
+
+		self.render_pipelines.insert(self.next_render_id, pipeline);
+		self.next_render_id += 1;
+		self.next_render_id - 1
+	}
+	///Adds a new compute pipeline to the heatwave window using the descriptor provided.
+	/// 
+	///Fills in the layout with this heatwave instance's pipeline layout if none is provided
+	pub fn add_compute_pipeline<'b>(&mut self, descriptor: impl Into<ComputePipelineDescriptor<'b>>) -> usize {
+		let mut desc: ComputePipelineDescriptor = descriptor.into();
+		if desc.layout.is_none() {
+			desc.layout = Some(&self.pipeline_layout);
+		}
+		let pipeline = self.connection.device().create_compute_pipeline(&desc);
+
+		self.compute_pipelines.insert(self.next_compute_id, pipeline);
+		self.next_compute_id += 1;
+		self.next_compute_id - 1
+	}
+
+	///Finalises this app, returning a runnable version.\
+	///Changes can be made later on, but they must be done either during a render operation or on a user input.
+	pub fn build_runner<P>(mut self, presenter: P) -> HeatwaveRunner<'a, P> 
+	where
+		P: Presenter {
+		HeatwaveRunner {
+			presenter,
+			event_loop: self.event_loop.take().expect("Expected valid event loop inside heatwave app"),
+			app: self
+		}
+	}
+
+	///Returns a thread safe reference to the window
+	pub fn window(&self) -> Arc<Window> {
+		self.window.clone()
+	}
+}
+
+pub struct HeatwaveRunner<'a, Handler> where
+	Handler: Presenter {
+	presenter: Handler,
+	event_loop: EventLoop<()>,
+	app: HeatwaveApp<'a>,
+}
+impl<'a, Handler> HeatwaveRunner<'a, Handler> where
+Handler: Presenter {
+	///Runs the app, opening the window and starting the event loop. This runs with some premade event loop handler and instructions that make use of the presenter in the documented ways.\ 
+	/// The default event loop handler is designed to be stable, lightweight and a suitable fit for most applications. It should handle edge cases gracefully.
+	/// 
+	/// If you need a custom event loop handler, see [`HeatwaveApp::run_custom`]
+	/// 
+	/// This consumes the HeatwaveApp object, and occupies the running thread.\
+	/// Rendering and user input handling are on separate threads.
+	pub fn run(self) {
+
+	}
+	///Runs the app, opening the window and starting the event loop. This runs with the provided event loop handler, and as such makes no guarantees about the interaction with the presenter.
+	pub fn run_custom<HandleFn>(self, handler: HandleFn) -> Result<(), EventLoopError> where
+	HandleFn: Fn(EventArgs, &HeatwaveApp, Arc<RwLock<Handler>>)
+	{
+		let presenter_ref = Arc::new(RwLock::new(self.presenter));
+
+		self.event_loop.run(move |event, target| {
+			handler(EventArgs {
+				event,
+				target
+			}, &self.app, presenter_ref.clone());
+		})
+	}
+}
+
+///Contains the arguments for an event loop event.
+pub struct EventArgs<'a> {
+	///The event that was called, sent by winit
+	event: Event<()>,
+	///The target associating the sender with this event loop
+	target: &'a EventLoopWindowTarget<()>,
 }
 
 /// Configuration for the heatwave window and graphics.
@@ -114,7 +228,7 @@ impl<'a> HeatwaveApp<'a> {
 /// //voila, you have your window!
 /// ```
 #[derive(Clone, Debug)]
-pub struct HeatwaveConfig {
+pub struct HeatwaveConfig<'a> {
 	///Preference for the power of the physical device used for rendering.
 	/// 
 	///Defaults to HighPerformance
@@ -191,8 +305,18 @@ pub struct HeatwaveConfig {
 	/// 
 	/// Defaults to `false`, though this behaviour might vary on platform.
 	pub active_on_open: bool,
+	/// Adds bind groups to shader sets.
+	/// 
+	/// Defaults to an empty list (no bind groups)
+	pub bind_groups: &'a [BindGroupLayoutDescriptor<'a>],
+	/// Adds push constant ranges to shaders.
+	/// 
+	/// Defaults to an empty list.
+	/// 
+	/// **The feature "Feature::PUSHCONSTANTS` must be enabled for this to work**
+	pub push_constants: &'a [PushConstantRange]
 }
-impl Default for HeatwaveConfig {
+impl<'a> Default for HeatwaveConfig<'a> {
     fn default() -> Self {
         Self { 
 			power_preference: wgpu::PowerPreference::HighPerformance, //Default to the best GPU it can find, as this is the most common one to ask for
@@ -212,11 +336,13 @@ impl Default for HeatwaveConfig {
             decorations: true,
             window_layer: WindowLevel::Normal,
 			active_on_open: true,
+			bind_groups: &[],
+			push_constants: &[]
 		}
     }
 }
 
- pub enum HeatwaveInitialiseError {
+pub enum HeatwaveInitialiseError {
 	GpuConnection(GpuConnectionError),
 	EventLoopCreation(EventLoopError),
 	WindowCreation(OsError)

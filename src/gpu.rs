@@ -7,9 +7,9 @@ use crate::HeatwaveConfig;
 
 ///Holds all relevant CPU objects for communication with the GPU
 pub struct GpuConnection<'window> {
-	//This is commented out as instance isn't currently needed. Comment this back in if instance is needed later down the line
+	//This is commented out as instance isn't currently needed outside of init. Comment this back in if instance is needed later down the line
 	//instance: wgpu::Instance,
-	//This is commented out as adapter isn't currently needed. Comment this back in if adapter is needed later down the line
+	//This is commented out as adapter isn't currently needed outside of init. Comment this back in if adapter is needed later down the line
 	//adapter: wgpu::Adapter,
 
 	///Reference to the presentable surface (Where the GPU draws to)
@@ -28,10 +28,12 @@ impl<'window> GpuConnection<'window> {
 	///Creates a new GPU connection bound to the window provided.
 	/// 
 	///# Errors
-	/// 
+	/// May error if an adapter that meets the requirements of the app is not found
+	/// May error during requesting of a physical device
+	/// May error during creation of the render surface. 
 	///# Panics
 	/// On iOS, this will panic if not called on the main thread.
-	pub async fn new(window: Arc<Window>, config: &HeatwaveConfig) -> Result<Self, GpuConnectionError> 
+	pub async fn new(window: Arc<Window>, config: &HeatwaveConfig<'_>) -> Result<Self, GpuConnectionError> 
 	{
 		let size = window.inner_size();
 
@@ -102,6 +104,12 @@ impl<'window> GpuConnection<'window> {
 			queue,
 			texture_size: size
 		})
+	}
+	pub fn device(&self) -> &wgpu::Device {
+		&self.device
+	}
+	pub fn surface_config(&self) -> &wgpu::SurfaceConfiguration {
+		&self.surface_config
 	}
 }
 
