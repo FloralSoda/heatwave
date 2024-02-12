@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use gpu::{GpuConnection, GpuConnectionError};
 use rendering::Presenter;
-use wgpu::{BindGroupLayoutDescriptor, ComputePipelineDescriptor, Features, PipelineLayout, PushConstantRange, RenderPipelineDescriptor};
+use wgpu::{util::{BufferInitDescriptor, DeviceExt}, BindGroupLayoutDescriptor, BufferDescriptor, ComputePipelineDescriptor, Features, PipelineLayout, PushConstantRange, RenderPipelineDescriptor};
 use winit::{error::{EventLoopError, OsError}, event::Event, event_loop::{EventLoop, EventLoopWindowTarget}, window::{Fullscreen, Window, WindowBuilder, WindowButtons, WindowLevel}};
 
 ///Contains any structs relating to GPU connections and GPU objects
@@ -110,8 +110,41 @@ impl<'a> HeatwaveApp<'a> {
 		})
 	}
 
+	///Adds a new buffer to the heatwave window using the descriptor provided.
+	/// 
+	///Returns the ID of the buffer, for later access
+	///# Substitution
+	/// Has no substitution behaviour.
+	pub fn add_buffer<'b>(&mut self, descriptor: impl Into<BufferDescriptor<'b>>) -> usize {
+		let desc = descriptor.into();
+
+		let buffer = self.connection.device().create_buffer(&desc);
+
+		self.buffers.insert(self.next_buffer_id, buffer);
+		self.next_buffer_id += 1;
+		self.next_buffer_id - 1
+	}
+	///Adds a new buffer to the heatwave window using the descriptor provided.
+	///Specifically for buffers that have starting values
+	/// 
+	///Returns the ID of the buffer, for later access
+	/// 
+	/// # Substitution
+	/// Has no substitution behaviour.
+	pub fn add_buffer_with_defaults<'b>(&mut self, descriptor: impl Into<BufferInitDescriptor<'b>>) -> usize {
+		let desc = descriptor.into();
+
+		let buffer = self.connection.device().create_buffer_init(&desc);
+
+		self.buffers.insert(self.next_buffer_id, buffer);
+		self.next_buffer_id += 1;
+		self.next_buffer_id - 1
+	}
 	///Adds a new render pipeline to the heatwave window using the descriptor provided.
 	/// 
+	///Returns the ID of the pipeline, for calling later
+	/// 
+	/// # Substitution
 	///Fills in the layout with this heatwave instance's pipeline layout if none is provided
 	/// 
 	///Fills in a render target for the fragment shader is none are provided but a fragment shader is provided.\
@@ -141,7 +174,10 @@ impl<'a> HeatwaveApp<'a> {
 	}
 	///Adds a new compute pipeline to the heatwave window using the descriptor provided.
 	/// 
-	///Fills in the layout with this heatwave instance's pipeline layout if none is provided
+	///Returns the ID of the pipeline, for calling later
+	/// 
+	/// # Substitution
+	/// Fills in the layout with this heatwave instance's pipeline layout if none is provided
 	pub fn add_compute_pipeline<'b>(&mut self, descriptor: impl Into<ComputePipelineDescriptor<'b>>) -> usize {
 		let mut desc: ComputePipelineDescriptor = descriptor.into();
 		if desc.layout.is_none() {
