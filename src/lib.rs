@@ -5,12 +5,14 @@
 //! 
 //! Though this project uses wgpu in its backend, it doesn't currently fully support wasm.
 
-use std::{collections::HashMap, sync::{Arc, RwLock}};
+use std::{collections::HashMap, path::PathBuf, sync::{mpsc::channel, Arc, RwLock}, thread};
 
 use gpu::{GpuConnection, GpuConnectionError};
-use rendering::Presenter;
+use rendering::{AnalogAxisEventArgs, KeyPressEventArgs, MousePressEventArgs, MouseScrollEventArgs, Presenter, RenderHelper};
 use wgpu::{util::{BufferInitDescriptor, DeviceExt}, BindGroupLayoutDescriptor, BufferDescriptor, ComputePipelineDescriptor, Features, PipelineLayout, PushConstantRange, RenderPipelineDescriptor};
-use winit::{error::{EventLoopError, OsError}, event::Event, event_loop::{EventLoop, EventLoopWindowTarget}, window::{Fullscreen, Window, WindowBuilder, WindowButtons, WindowLevel}};
+use winit::{dpi::{PhysicalPosition, PhysicalSize}, error::{EventLoopError, OsError}, event::{AxisId, DeviceId, ElementState, Event, Ime, InnerSizeWriter, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, Touch, TouchPhase}, event_loop::{EventLoop, EventLoopWindowTarget}, window::{Fullscreen, Window, WindowBuilder, WindowButtons, WindowLevel}};
+use log::{error,warn};
+use rayon::prelude::*;
 
 ///Contains any structs relating to GPU connections and GPU objects
 pub mod gpu;
@@ -30,6 +32,7 @@ pub struct HeatwaveApp<'a> {
 	next_render_id: usize,
 	next_compute_id: usize,
 	
+	skybox: wgpu::Color,
 	pipeline_layout: PipelineLayout,
 
 	event_loop: Option<EventLoop<()>>,
@@ -106,7 +109,8 @@ impl<'a> HeatwaveApp<'a> {
 			next_compute_id: 0,
 			next_render_id: 0,
 			connection,
-			pipeline_layout
+			pipeline_layout,
+			skybox: config.skybox
 		})
 	}
 
@@ -206,6 +210,10 @@ impl<'a> HeatwaveApp<'a> {
 	pub fn window(&self) -> Arc<Window> {
 		self.window.clone()
 	}
+
+	pub fn connection(&self) -> &GpuConnection {
+		&self.connection
+	}
 }
 
 pub struct HeatwaveRunner<'a, Handler> where
@@ -215,7 +223,91 @@ pub struct HeatwaveRunner<'a, Handler> where
 	app: HeatwaveApp<'a>,
 }
 impl<'a, Handler> HeatwaveRunner<'a, Handler> where
-Handler: Presenter {
+Handler: Presenter + Send {
+	///The handler used by [`HeatwaveRunner::run`]
+	/// 
+	///Public only for people using [`HeatwaveRunner::run_custom`] to use as a fallback/base implementation for their custom handlers
+	pub fn default_handler(args: EventArgs, app: &HeatwaveApp, presenter: &mut Handler) {
+		let (sender_presenter, receiver_user) = channel();
+		let (sender_user, receiver_presenter) = channel();
+
+		thread::spawn(move || {
+			//Supplementary data, used to set up additional tracked information
+			let mut mouse_position: PhysicalPosition<f64> = PhysicalPosition::new(0.0,0.0);
+
+			loop {
+				match receiver_user.recv() {
+					Err(_) => { 
+						warn!("Main thread disconnected early!");
+						break;
+					},
+					Ok(event) => {
+						match event {
+							WindowEvent::CloseRequested | WindowEvent::Destroyed => { presenter.on_exit(); sender_user.send(UserEvent::ReadyToClose); }
+							WindowEvent::CursorEntered { device_id } => presenter.on_cursor_enter(device_id),
+							WindowEvent::CursorMoved { device_id, position } => {presenter.on_cursor_move(device_id, position); mouse_position = position;},
+							WindowEvent::CursorLeft { device_id } => presenter.on_cursor_leave(device_id),
+							WindowEvent::AxisMotion { device_id, axis, value } => presenter.on_analog_axis_motion(AnalogAxisEventArgs { device_id, axis, value }),
+							WindowEvent::DroppedFile(path) => presenter.on_file_drop(path),
+							WindowEvent::HoveredFile(path) => presenter.on_file_hover(path),
+							WindowEvent::HoveredFileCancelled => presenter.on_file_hover_cancel(),
+							WindowEvent::Focused(focus) => presenter.on_window_focus_changed(focus),
+							WindowEvent::Ime(ime) => presenter.on_ime_input(ime),
+							WindowEvent::KeyboardDown { device_id, event, is_synthetic } => presenter.on_key_press(KeyPressEventArgs { device_id, event, is_synthetic }),
+							WindowEvent::KeyboardUp { device_id, event, is_synthetic } => presenter.on_key_release(KeyPressEventArgs { device_id, event, is_synthetic }),
+							WindowEvent::ModifiersChanged(mods) => presenter.on_modifier_changed(mods),
+							WindowEvent::MouseDown { device_id, state, button } => presenter.on_mouse_down(MousePressEventArgs { device_id, state, button, position: mouse_position }),
+							WindowEvent::MouseUp { device_id, state, button } => presenter.on_mouse_up(MousePressEventArgs { device_id, state, button, position: mouse_position }),
+							WindowEvent::MouseWheel { device_id, delta, phase } => presenter.on_mouse_scroll( MouseScrollEventArgs { device_id, delta, phase }),
+							WindowEvent::Occluded(occlude) => presenter.on_occlusion(occlude),
+							WindowEvent::RequestRenderData => { sender_user.send(UserEvent::RenderDataPrepared(presenter.package_render_data())); },
+							WindowEvent::Resized(size) => presenter.on_window_resize(size),
+							WindowEvent::Moved(position) => presenter.on_window_move(position),
+							WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer } => presenter.on_scale_factor_change(scale_factor, inner_size_writer),
+							WindowEvent::Touch(touch) => presenter.on_touch(touch),
+							WindowEvent::Unknown => warn!("Unknown event from window!")
+						}
+					}
+				}
+			}
+		}).join().expect("User event handling thread failed!");
+
+		match args.event {
+			Event::WindowEvent { window_id, event } if window_id == app.window().id() => {
+				match event {
+					winit::event::WindowEvent::RedrawRequested => {
+						sender_presenter.send(WindowEvent::RequestRenderData);
+						loop {
+							let response = receiver_presenter.recv().expect("The user event thread exited early! Cannot render frame");
+							if let UserEvent::RenderDataPrepared(render_data) = response {
+								Handler::render(render_data, Some(RenderHelper::new(app)));
+								break;
+							}
+
+ 						    error!("Desync between render and user event thread! Ignoring non-render data response from user");
+						}
+					},
+					winit::event::WindowEvent::CloseRequested => {
+
+						args.target.exit();
+						loop {
+							match receiver_presenter.recv() {
+								Err(_) => warn!("User thread closed improperly!"),
+								Ok(message) => { match message {
+									UserEvent::ReadyToClose => break,
+									_ => error!("Desync between render and user event thread! Ignoring non-closing response from user"),
+								}}
+							}
+						}
+					},
+					event => {
+						sender_presenter.send(event.into());
+					}
+				} 
+			},
+			_ => {}
+		};
+	}
 	///Runs the app, opening the window and starting the event loop. This runs with some premade event loop handler and instructions that make use of the presenter in the documented ways.\ 
 	/// The default event loop handler is designed to be stable, lightweight and a suitable fit for most applications. It should handle edge cases gracefully.
 	/// 
@@ -223,24 +315,113 @@ Handler: Presenter {
 	/// 
 	/// This consumes the HeatwaveApp object, and occupies the running thread.\
 	/// Rendering and user input handling are on separate threads.
-	pub fn run(self) {
-
+	pub fn run(self) -> Result<(), EventLoopError> {
+		self.run_custom(Self::default_handler)
 	}
 	///Runs the app, opening the window and starting the event loop. This runs with the provided event loop handler, and as such makes no guarantees about the interaction with the presenter.
-	pub fn run_custom<HandleFn>(self, handler: HandleFn) -> Result<(), EventLoopError> where
-	HandleFn: Fn(EventArgs, &HeatwaveApp, Arc<RwLock<Handler>>)
+	pub fn run_custom<HandleFn>(mut self, handler: HandleFn) -> Result<(), EventLoopError> where
+	HandleFn: Fn(EventArgs, &HeatwaveApp, &mut Handler)
 	{
-		let presenter_ref = Arc::new(RwLock::new(self.presenter));
-
 		self.event_loop.run(move |event, target| {
 			handler(EventArgs {
 				event,
 				target
-			}, &self.app, presenter_ref.clone());
+			}, &self.app, &mut self.presenter);
 		})
 	}
 }
 
+///Mirrors [`winit::event::WindowEvent`] and adds some Heatwave specific communication events
+#[derive(Clone, PartialEq, Debug)]
+pub enum WindowEvent {
+	///Raises when the window is resized. Contains the new client dimensions
+	Resized(PhysicalSize<u32>),
+	///Raises when the window is moved. Contains the window's new coordinates
+	Moved(PhysicalPosition<i32>),
+	///Raises when the window is trying to close
+	CloseRequested,
+	///Raises when the window was destroyed
+	Destroyed,
+	///Raises when a file hover is dropped on the window
+	DroppedFile(PathBuf),
+	///Raises when one or more files are hovered over the window. Will raise for each file selected
+	HoveredFile(PathBuf),
+	///Raises when a file hover is cancelled. Will raise only once regardless of file count
+	HoveredFileCancelled,
+	///Raises when the window is focused or unfocused (If it's the current operating window)
+	Focused(bool),
+	///Raises when a key is pressed on the keyboard
+	KeyboardDown { device_id: DeviceId, event:KeyEvent, is_synthetic: bool},
+	///Raises when a key is released on the keyboard
+	KeyboardUp { device_id: DeviceId, event:KeyEvent, is_synthetic: bool},
+	///Raises when the keyboard modifiers have changed (Shift, Ctrl, etc.)
+	ModifiersChanged(Modifiers),
+	///Raises when typing a character via Ime
+	Ime(Ime),
+	///Raises when the mouse cursor moves inside the window
+	CursorMoved { device_id: DeviceId, position: PhysicalPosition<f64>},
+	///Raises when the mouse cursor enters the bounds of the window
+	CursorEntered { device_id: DeviceId },
+	///Raises when the mouse cursor leaves the bounds of the window
+	CursorLeft { device_id: DeviceId },
+	///Raises when a mouse wheel or touchpad scroll occurred
+	MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase },
+	///Raises when a mouse button was pressed
+	MouseDown { device_id: DeviceId, state: ElementState, button: MouseButton },
+	///Raises when a mouse button was raised
+	MouseUp { device_id: DeviceId, state: ElementState, button: MouseButton },
+	///Raises when some analog control device (such as a joystick or gamepad) changes stick position
+	AxisMotion { device_id: DeviceId, axis: AxisId, value: f64 },
+	///Raises when the window has been touched on a touch compatible screen
+	Touch(Touch),
+	///Raises when the window's scale factor changes (DPI change due to resolution change, scale change or just moving to a different screen)
+	ScaleFactorChanged { scale_factor: f64, inner_size_writer: InnerSizeWriter },
+	///Raises when the window is totally hidden from view. Not supported on Android or Windows.
+	Occluded(bool),
+	///This is raised for events that aren't handled by Heatwave (usually due to being widely unsupported, such as Mac forcetouch events)
+	Unknown,
+	
+	///Raised when the window needs render data to render the next frame. 
+	///
+	///In the default event handler, the event loop is blocked until [`UserEvent::RenderDataPrepared`] is sent back 
+	RequestRenderData
+}
+impl From<winit::event::WindowEvent> for WindowEvent {
+	fn from(value: winit::event::WindowEvent) -> Self {
+		match value {
+			winit::event::WindowEvent::Resized(size) => Self::Resized(size),
+			winit::event::WindowEvent::Moved(position) => Self::Moved(position),
+			winit::event::WindowEvent::CloseRequested => Self::CloseRequested,
+			winit::event::WindowEvent::Destroyed => Self::Destroyed,
+			winit::event::WindowEvent::DroppedFile(path) => Self::DroppedFile(path),
+			winit::event::WindowEvent::HoveredFile(path) => Self::HoveredFile(path),
+			winit::event::WindowEvent::HoveredFileCancelled => Self::HoveredFileCancelled,
+			winit::event::WindowEvent::Focused(focus) => Self::Focused(focus),
+			winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } if event.state.is_pressed() => Self::KeyboardDown { device_id, event, is_synthetic },
+			winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } => Self::KeyboardUp { device_id, event, is_synthetic },
+			winit::event::WindowEvent::ModifiersChanged(mods) => Self::ModifiersChanged(mods),
+			winit::event::WindowEvent::Ime(ime) => Self::Ime(ime),
+			winit::event::WindowEvent::CursorMoved { device_id, position} => Self::CursorMoved { device_id, position },
+			winit::event::WindowEvent::CursorEntered { device_id } => Self::CursorEntered { device_id },
+			winit::event::WindowEvent::CursorLeft { device_id } => Self::CursorLeft { device_id },
+			winit::event::WindowEvent::MouseWheel { device_id, delta, phase } => Self::MouseWheel { device_id, delta, phase },
+			winit::event::WindowEvent::MouseInput { device_id, state, button } if state.is_pressed() => Self::MouseDown { device_id, state, button },
+			winit::event::WindowEvent::MouseInput { device_id, state, button } => Self::MouseUp { device_id, state, button },
+			winit::event::WindowEvent::AxisMotion { device_id, axis, value } => Self::AxisMotion { device_id, axis, value },
+			winit::event::WindowEvent::Touch(touch) => Self::Touch(touch),
+			winit::event::WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer } => Self::ScaleFactorChanged { scale_factor, inner_size_writer },
+			winit::event::WindowEvent::Occluded(occlude) => Self::Occluded(occlude),
+			_ => Self::Unknown
+		}
+	}
+}
+///A set of events returned by the user event handler for communication between threads
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum UserEvent<RenderData> {
+	///Raised when the user event handler have finished its clean up
+	ReadyToClose,
+	RenderDataPrepared(RenderData)
+}
 ///Contains the arguments for an event loop event.
 pub struct EventArgs<'a> {
 	///The event that was called, sent by winit
@@ -350,7 +531,9 @@ pub struct HeatwaveConfig<'a> {
 	/// Defaults to an empty list.
 	/// 
 	/// **The feature "Feature::PUSHCONSTANTS` must be enabled for this to work**
-	pub push_constants: &'a [PushConstantRange]
+	pub push_constants: &'a [PushConstantRange],
+	///What to render behind everything
+	pub skybox: wgpu::Color
 }
 impl<'a> Default for HeatwaveConfig<'a> {
     fn default() -> Self {
@@ -373,7 +556,13 @@ impl<'a> Default for HeatwaveConfig<'a> {
             window_layer: WindowLevel::Normal,
 			active_on_open: true,
 			bind_groups: &[],
-			push_constants: &[]
+			push_constants: &[],
+			skybox: wgpu::Color {
+				a: 1.0,
+				r: 0.5,
+				g: 0.5,
+				b: 0.5
+			}
 		}
     }
 }

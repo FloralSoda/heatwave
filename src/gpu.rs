@@ -3,7 +3,7 @@ use std::sync::Arc;
 use wgpu::{CreateSurfaceError, RequestDeviceError};
 use winit::window::Window;
 
-use crate::HeatwaveConfig;
+use crate::{rendering::Texture, HeatwaveConfig};
 
 ///Holds all relevant CPU objects for communication with the GPU
 pub struct GpuConnection<'window> {
@@ -22,6 +22,8 @@ pub struct GpuConnection<'window> {
 	queue: wgpu::Queue,
 	///The size of the current draw texture.
 	texture_size: winit::dpi::PhysicalSize<u32>,
+	///The texture used to maintain object depth,
+	depth_texture: crate::rendering::Texture
 }
 
 impl<'window> GpuConnection<'window> {
@@ -98,18 +100,25 @@ impl<'window> GpuConnection<'window> {
 		Ok(GpuConnection {
 			//instance,
 			//adapter,
+			depth_texture: Texture::create_depth_texture(&device, &surface_config, "Heatwave Depth"),
 			surface,
 			surface_config,
 			device,
 			queue,
-			texture_size: size
+			texture_size: size,
 		})
 	}
 	pub fn device(&self) -> &wgpu::Device {
 		&self.device
 	}
+	pub fn surface(&self) -> &wgpu::Surface {
+		&self.surface
+	}
 	pub fn surface_config(&self) -> &wgpu::SurfaceConfiguration {
 		&self.surface_config
+	}
+	pub fn depth_texture(&self) -> &Texture {
+		&self.depth_texture
 	}
 }
 
