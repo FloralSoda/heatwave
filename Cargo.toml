@@ -21,7 +21,6 @@ image = { version="0.24", features=["png"], default-features = false}
 raw-window-handle = "0.6"
 cfg-if = "1"
 bitflags = "2"
-rayon = "1.8.1"
 
 
 [dev-dependencies]
